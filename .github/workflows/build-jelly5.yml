@@ -1,0 +1,100 @@
+# Builds Jelly5 with the library-banner fix (the source pills scroll to keep the
+# focused library on screen). Start it from the Actions tab: "Build Jelly5" ->
+# "Run workflow". The result is a download called PPSA99505 on the run's page.
+name: Build Jelly5
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Install the build tools (LLVM 21, which the app is tested with)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl wget unzip zip python3-venv \
+            nasm meson ninja-build pkg-config lsb-release software-properties-common gnupg
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash /tmp/llvm.sh 21
+          sudo apt-get install -y clang-21 lld-21 llvm-21
+          echo "LLVM_CONFIG=llvm-config-21" >> "$GITHUB_ENV"
+          chmod +x scripts/*.sh app/scripts/*.sh toolkit/scripts/*.sh
+
+      - name: Apply the library banner fix
+        run: |
+          python3 - <<'PY'
+          import sys
+
+          def patch(path, old, new):
+              src = open(path, encoding="utf-8", newline="").read()
+              if new in src:
+                  print("already fixed: " + path)
+                  return
+              if src.count(old) != 1:
+                  sys.exit("ERROR: could not find the code to replace in " + path + " (the app's code has changed)")
+              open(path, "w", encoding="utf-8", newline="").write(src.replace(old, new))
+              print("patched: " + path)
+
+          patch("app/src/ui/library.h",
+                "    Drop m_src_drop, m_sort_drop;       /* the focus on the sources and the sorts */\n",
+                "    Drop m_src_drop, m_sort_drop;       /* the focus on the sources and the sorts */\n"
+                "    Anim m_src_scroll;                  /* the sources, slid to keep the focused one in view */\n")
+
+          patch("app/src/ui/library.cpp",
+                "            tw = pill_bar(kPad - 6, hy - 50, labels, here ? m_pill : m_source, here, m_src_drop, dt, ha, &m_animating,\n"
+                "                          0, hy) - 2 * 6;\n",
+                r'''            /* More sources than fit: the bar slides to keep the focused one in view, and is
+                       * cut off before the title count and the sort & filter button on the right. */
+                      const int on = here ? m_pill : m_source;
+                      std::string sort_state = T(kSorts[m_sort].label);
+                      if (active_filters() > 0)
+                          sort_state += std::string("  \xC2\xB7  ") + TN(active_filters(), "%d filter", "%d filtre");
+                      const float right = gfx::W - kPad - 66 - 18 - gfx::text_width(sort_state, {gfx::Medium, 22, 520}) - 40;
+                      const float count_w =
+                          total >= 0 ? gfx::text_width(TN(total, "%d tittel", "%d titler"), {gfx::Medium, 24}) + 20 : 0;
+                      const float x0 = kPad - 6, bw = pill_bar_width(labels);
+                      const float room = std::max(300.f, right - count_w - x0);
+                      const float off = row_scroll(m_src_scroll, bw, room, pill_bar_center(labels, on), dt, &m_animating);
+                      gfx::push_scissor({x0, hy - 80, room, 140});
+                      pill_bar(x0 - off, hy - 50, labels, on, here, m_src_drop, dt, ha, &m_animating, x0 - off, hy);
+                      gfx::pop_scissor();
+                      tw = std::min(bw, room) - 2 * 6;
+          ''')
+          PY
+          git diff --stat
+
+      - name: Keep the PS5 toolchain between runs
+        uses: actions/cache@v4
+        with:
+          path: toolchain
+          key: ps5-toolchain-llvm21-${{ hashFiles('scripts/setup-toolchain.sh', 'scripts/build-av1.sh') }}
+
+      - name: Set up the PS5 toolchain (first run ~10-15 min)
+        run: scripts/setup-toolchain.sh
+
+      - name: Build the app
+        run: |
+          eval "$(scripts/setup-toolchain.sh --env)"
+          cd app
+          ./scripts/build.sh
+
+      - name: Save the app for download
+        uses: actions/upload-artifact@v4
+        with:
+          name: PPSA99505
+          path: app/build/app/PPSA99505/
+
+      - name: Save the build logs if it failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            app/build/*.log
+            app/build/*.txt
+          if-no-files-found: ignore
