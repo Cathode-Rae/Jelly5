@@ -65,6 +65,12 @@ jobs:
                       gfx::pop_scissor();
                       tw = std::min(bw, room) - 2 * 6;
           ''')
+
+          # build.sh's .rodata check: awk quit after the first match, so llvm-readelf died
+          # writing the rest ("Broken pipe") and pipefail failed the build. Read it all.
+          patch("app/scripts/build.sh",
+                r"""awk '$1=="LOAD" && $7=="R" && $8 ~ /^0x/ {print $2; exit}'""",
+                r"""awk '$1=="LOAD" && $7=="R" && $8 ~ /^0x/ && !f {print $2; f=1}'""")
           PY
           git diff --stat
 
