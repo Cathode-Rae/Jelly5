@@ -1,4 +1,4 @@
-# Builds Jelly5 with these fixes. Start it from the Actions tab:
+# Builds Jelly5 with the library-banner fixes. Start it from the Actions tab:
 # "Build Jelly5" -> "Run workflow". The result is a download called PPSA99505 on
 # the run's page.
 #
@@ -9,9 +9,8 @@
 #    swinging back.
 #  - Left/right move through the libraries only; Square (shown as a hint) or Up from
 #    the grid's right half reaches sort & filter.
-#  - Smoother video (issue #52): the audio clock the picture follows moves smoothly
-#    instead of in 42.7 ms steps.
-#  - build.sh: the "Broken pipe" failure on Linux.
+#  - build.sh: the "Broken pipe" failure on Linux (needed for this build to work).
+# Playback is untouched: exactly as in the official app.
 name: Build Jelly5
 
 on:
@@ -179,107 +178,6 @@ jobs:
           patch("app/scripts/build.sh",
                 r"""awk '$1=="LOAD" && $7=="R" && $8 ~ /^0x/ {print $2; exit}'""",
                 r"""awk '$1=="LOAD" && $7=="R" && $8 ~ /^0x/ && !f {print $2; f=1}'""")
-
-          # =====================================================================================
-          # Smooth playback (issue #52): the audio clock the picture follows moves smoothly
-          # between its 42.7 ms output blocks, instead of in steps. Nothing else in playback
-          # changes.
-          # =====================================================================================
-          patch("app/engine/media/include/evo_audio_out.h",
-                "float evo_audio_play_speed(void);\n",
-                "float evo_audio_play_speed(void);\n"
-                "/* Jelly5 #52: the audio clock moving smoothly between output blocks (for video pacing). */\n"
-                "double evo_audio_clock_smooth_s(void);\n")
-
-          patch("app/engine/media/src/evo_audio_out.c",
-                "volatile double audio_clock_seconds = 0.0;\n",
-                r'''volatile double audio_clock_seconds = 0.0;
-
-          /* Jelly5 smooth playback (issue #52). audio_clock_seconds moves once per output block
-           * (2048 samples, 42.7 ms), so video paced on it went out in bursts: two frames at once,
-           * then a gap. Each block's hand-over is stamped here, and evo_audio_clock_smooth_s()
-           * moves on between stamps by the wall time passed. It runs half a block behind the
-           * stepped value at each stamp, so on average the A/V sync is what it was. */
-          #include <stdint.h>
-          #include <time.h>
-          static volatile unsigned s_clk_seq;
-          static double s_clk_base, s_clk_adv, s_clk_wall;
-          static uint64_t s_clk_host_us;
-
-          static uint64_t clk_now_us(void)
-          {
-              struct timespec ts;
-              clock_gettime(CLOCK_MONOTONIC, &ts);
-              return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
-          }
-
-          /* After audio_clock_seconds moved on: adv_s of media in a block that plays for wall_s. */
-          static void clk_stamp(double adv_s, double wall_s)
-          {
-              const uint64_t now = clk_now_us();
-              __atomic_add_fetch(&s_clk_seq, 1u, __ATOMIC_ACQ_REL);   /* odd: being written */
-              s_clk_base = audio_clock_seconds;
-              s_clk_adv = adv_s;
-              s_clk_wall = wall_s;
-              s_clk_host_us = now;
-              __atomic_add_fetch(&s_clk_seq, 1u, __ATOMIC_ACQ_REL);   /* even: done */
-          }
-
-          double evo_audio_clock_smooth_s(void)
-          {
-              double base = 0.0, adv = 0.0, wall = 0.0;
-              uint64_t host = 0;
-              unsigned s0 = 1u, s1 = 0u;
-              for (int tries = 0; tries < 8; tries++) {
-                  s0 = __atomic_load_n(&s_clk_seq, __ATOMIC_ACQUIRE);
-                  base = s_clk_base;
-                  adv = s_clk_adv;
-                  wall = s_clk_wall;
-                  host = s_clk_host_us;
-                  __atomic_thread_fence(__ATOMIC_ACQUIRE);
-                  s1 = __atomic_load_n(&s_clk_seq, __ATOMIC_ACQUIRE);
-                  if (s0 == s1 && !(s0 & 1u))
-                      break;
-              }
-              const double stepped = audio_clock_seconds;
-              if (s0 != s1 || (s0 & 1u) || host == 0 || adv <= 0.0 || wall <= 0.0)
-                  return stepped;
-              if (stepped != base) {
-                  /* A block counted but not stamped yet: where the last one's run ends. A reset
-                   * (a seek, a stop, a new file): the stepped clock until the next block. */
-                  return (stepped > base && stepped - base < 1.0) ? base + adv * 0.5 : stepped;
-              }
-              double f = (double)(clk_now_us() - host) / 1e6 / wall;
-              if (f < 0.0)
-                  f = 0.0;
-              if (f > 1.0)
-                  f = 1.0;   /* no block since (an underrun): the clock waits with the sound */
-              return base + adv * (f - 0.5);
-          }
-          ''')
-
-          patch("app/engine/media/src/evo_audio_out.c",
-                "                    audio_samples_played += jelly5_bs_media_samples();\n"
-                "                    audio_clock_seconds = (double)audio_samples_played / 48000.0;\n",
-                "                    audio_samples_played += jelly5_bs_media_samples();\n"
-                "                    audio_clock_seconds = (double)audio_samples_played / 48000.0;\n"
-                "                    clk_stamp(jelly5_bs_media_samples() / 48000.0, jelly5_bs_media_samples() / 48000.0);   /* #52 */\n")
-
-          patch("app/engine/media/src/evo_audio_out.c",
-                "                audio_clock_seconds = (double)audio_samples_played / 48000.0;\n"
-                "            } else {\n",
-                "                audio_clock_seconds = (double)audio_samples_played / 48000.0;\n"
-                "                clk_stamp(media / 48000.0, (double)AUDIO_BLOCK_SAMPLES / 48000.0);   /* #52: the port plays 48 kHz */\n"
-                "            } else {\n")
-
-          # The picture waits on the smooth clock (the progress bar and subtitles keep the other).
-          patch("app/engine/media/src/evo_playback.c",
-                "            audio_rel = audio_clock_seconds - evo_av_offset_s;   /* Jelly5: the audio delay setting */\n",
-                "            audio_rel = evo_audio_clock_smooth_s() - evo_av_offset_s;   /* Jelly5: the audio delay setting; #52: the smooth clock */\n")
-
-          patch("app/engine/media/src/evo_playback.c",
-                "                    audio_rel = audio_clock_seconds - evo_av_offset_s;\n",
-                "                    audio_rel = evo_audio_clock_smooth_s() - evo_av_offset_s;   /* #52: the smooth clock */\n")
           PY
           git diff --stat
 
