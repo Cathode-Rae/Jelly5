@@ -1,6 +1,19 @@
-# Builds Jelly5 with the library-banner fix (the source pills scroll to keep the
-# focused library on screen). Start it from the Actions tab: "Build Jelly5" ->
-# "Run workflow". The result is a download called PPSA99505 on the run's page.
+# Builds Jelly5 with these fixes. Start it from the Actions tab:
+# "Build Jelly5" -> "Run workflow". The result is a download called PPSA99505 on
+# the run's page.
+#
+# What it changes:
+#  - The library pills: the glass bar keeps its size and the names slide inside it,
+#    fading at the edges where more lie beyond, only as far as needed (as the
+#    season bar on the detail page does).
+#  - The focus drop on those pills goes straight to the name and settles without
+#    swinging back.
+#  - Left/right move through the libraries only; Square (shown on screen as a hint)
+#    or Up from the grid's right half reaches sort & filter.
+#  - Smoother video (issue #52): the audio clock the picture follows moves smoothly
+#    instead of in 42.7 ms steps, and each frame goes out on the display refresh it
+#    belongs on (5:5 at 120 Hz, 3:2 at 60 Hz).
+#  - build.sh: the "Broken pipe" failure on Linux.
 name: Build Jelly5
 
 on:
@@ -25,10 +38,11 @@ jobs:
           echo "LLVM_CONFIG=llvm-config-21" >> "$GITHUB_ENV"
           chmod +x scripts/*.sh app/scripts/*.sh toolkit/scripts/*.sh
 
-      - name: Apply the library banner fix
+      - name: Apply the fixes
         run: |
           python3 - <<'PY'
           import sys
+
 
           def patch(path, old, new):
               src = open(path, encoding="utf-8", newline="").read()
@@ -40,37 +54,399 @@ jobs:
               open(path, "w", encoding="utf-8", newline="").write(src.replace(old, new))
               print("patched: " + path)
 
+
+          # --- The focus drop: an optional damping, so one group can settle without the bounce. ---
+          patch("app/src/ui/screen.h",
+                "    void hide() { m_shown = false; }\n",
+                "    void hide() { m_shown = false; }\n"
+                "    /* Jelly5 fix: the spring's damping. 19 (the default) overshoots and swings back;\n"
+                "     * 33 (about critical) settles on the target without passing it. */\n"
+                "    void set_damping(float d) { m_damp = d; }\n")
+          patch("app/src/ui/screen.h",
+                "    int m_key = -1;\n    bool m_shown = false, m_placed = false;\n",
+                "    int m_key = -1;\n    float m_damp = 19.f;\n    bool m_shown = false, m_placed = false;\n")
+          patch("app/src/ui/screen.cpp",
+                "        auto spring = [h](float &v, float &x, float to) {\n"
+                "            v += (260.f * (to - x) - 19.f * v) * h;\n",
+                "        const float damp = m_damp;\n"
+                "        auto spring = [h, damp](float &v, float &x, float to) {\n"
+                "            v += (260.f * (to - x) - damp * v) * h;\n")
+
+          # --- The library: where the names slide. ---
           patch("app/src/ui/library.h",
                 "    Drop m_src_drop, m_sort_drop;       /* the focus on the sources and the sorts */\n",
                 "    Drop m_src_drop, m_sort_drop;       /* the focus on the sources and the sorts */\n"
                 "    Anim m_src_scroll;                  /* the sources, slid to keep the focused one in view */\n")
 
+          # Left/right: through the libraries only; the sort button is off that path.
           patch("app/src/ui/library.cpp",
+                "            m_pill = (p & NUVIO_BTN_LEFT) ? std::max(0, m_pill - 1) : std::min(pill_count() - 1, m_pill + 1);\n",
+                r'''            /* Jelly5 fix: left/right go through the libraries only; the sort button is reached
+                       * with Square or Up from the grid's right half. From it, left goes back to the library. */
+                      const int last = ns > 0 && m_pill < ns ? ns - 1 : pill_count() - 1;
+                      const int to = m_pill == ns && ns > 0 && (p & NUVIO_BTN_LEFT) ? m_source
+                                                                                    : m_pill + ((p & NUVIO_BTN_RIGHT) ? 1 : -1);
+                      if (to < 0 || to > last)
+                          m_bump = true;   /* the end: a soft bump, as in the grid */
+                      else
+                          m_pill = to;
+          ''')
+
+          # The bar: fixed size, the names sliding inside it with faded edges, as the detail page's seasons.
+          patch("app/src/ui/library.cpp",
+                "            const bool here = m_focused && m_in_pills && m_pill < ns;\n"
+                "            /* The pane reaches 6 px past the pills on each side, so they start on the title's column;\n"
+                "             * tw: the pills' own width, as the title's. */\n"
                 "            tw = pill_bar(kPad - 6, hy - 50, labels, here ? m_pill : m_source, here, m_src_drop, dt, ha, &m_animating,\n"
                 "                          0, hy) - 2 * 6;\n",
-                r'''            /* More sources than fit: the bar slides to keep the focused one in view, and is
-                       * cut off before the title count and the sort & filter button on the right. */
-                      const int on = here ? m_pill : m_source;
+                r'''            const bool here = m_focused && m_in_pills && m_pill < ns;
+                      const int on = std::max(0, std::min(ns - 1, here ? m_pill : m_source));
+                      /* Jelly5 fix: with more sources than fit, the glass bar keeps its size, short of the
+                       * title count and the sort button, and the names slide inside it (as the seasons do
+                       * on the detail page): only as far as needed to keep the focused one in view with a
+                       * peek of the next, fading out on the side where more lie beyond. */
                       std::string sort_state = T(kSorts[m_sort].label);
                       if (active_filters() > 0)
                           sort_state += std::string("  \xC2\xB7  ") + TN(active_filters(), "%d filter", "%d filtre");
                       const float right = gfx::W - kPad - 66 - 18 - gfx::text_width(sort_state, {gfx::Medium, 22, 520}) - 40;
                       const float count_w =
                           total >= 0 ? gfx::text_width(TN(total, "%d tittel", "%d titler"), {gfx::Medium, 24}) + 20 : 0;
-                      const float x0 = kPad - 6, bw = pill_bar_width(labels);
-                      const float room = std::max(300.f, right - count_w - x0);
-                      const float off = row_scroll(m_src_scroll, bw, room, pill_bar_center(labels, on), dt, &m_animating);
-                      gfx::push_scissor({x0, hy - 80, room, 140});
-                      pill_bar(x0 - off, hy - 50, labels, on, here, m_src_drop, dt, ha, &m_animating, x0 - off, hy);
-                      gfx::pop_scissor();
-                      tw = std::min(bw, room) - 2 * 6;
+                      const float x0 = kPad - 6, y0 = hy - 50, full = pill_bar_width(labels);
+                      const float bar_w = std::min(full, std::max(300.f, right - count_w - x0));
+                      const float span = full - bar_w;   /* how far the names can slide: 0 when they all fit */
+                      const float l = pill_bar_offset(labels, on), r = pill_bar_offset(labels, on + 1) - 6;
+                      const float peek = std::max(0.f, std::min(90.f, (bar_w - (r - l)) / 2));
+                      float t = std::max(0.f, std::min(span, m_src_scroll.target));
+                      if (l - peek < t)
+                          t = l - peek;
+                      if (r + peek > t + bar_w)
+                          t = r + peek - bar_w;
+                      t = std::max(0.f, std::min(span, t));
+                      if (here) {
+                          m_src_scroll.to(t);
+                          if (m_src_scroll.step(dt, 12.f))
+                              m_animating = true;
+                      } else {
+                          m_src_scroll.snap(t);
+                      }
+                      const float sx = m_src_scroll.value;
+                      const gfx::Rect bar{x0, y0, bar_w, 76};
+                      glass_panel(bar, 38, ha, false);
+                      /* The drop goes straight to where the focused name comes to rest (not where it is
+                       * mid-slide) and settles there without the bounce, so it never runs past and swings back. */
+                      m_src_drop.set_damping(33.f);
+                      m_src_drop.to({x0 + l - t, y0 + 6, r - l, 64}, on, 0, hy);
+                      m_src_drop.draw(dt, ha * (here ? 1.f : 0.4f), &m_animating);
+                      if (span > 0) {
+                          gfx::push_scissor(bar);
+                          gfx::push_fade_mask(bar, 0, 0, edge_fade(sx, 64), edge_fade(span - sx, 64));
+                      }
+                      for (int i = 0; i < ns; i++) {
+                          const float li = pill_bar_offset(labels, i), wi = pill_bar_offset(labels, i + 1) - 6 - li;
+                          const float px = x0 + li - sx;
+                          if (px > x0 + bar_w || px + wi < x0)
+                              continue;
+                          gfx::TextStyle ts{gfx::Bold, 30};
+                          ts.max_w = wi - 40;
+                          marquee_text(px + wi / 2, y0 + 48, labels[i], ts, alpha(i == on ? kText : kText2, ha), here && i == on,
+                                       1);
+                      }
+                      if (span > 0) {
+                          gfx::pop_fade_mask();
+                          gfx::pop_scissor();
+                      }
+                      tw = bar_w - 2 * 6;
           ''')
 
-          # build.sh's .rodata check: awk quit after the first match, so llvm-readelf died
-          # writing the rest ("Broken pipe") and pipefail failed the build. Read it all.
+          # Say that Square opens sort & filter (it always has, from anywhere on this screen).
+          patch("app/src/ui/library.cpp",
+                "        if (by_name() && !m_in_pills) {   /* A-Å: the letter jump, shown where it works */\n"
+                "            draw_pad_hints(bx - 18 - sw, hy + 44, {{PadButton::L2, \"\"}, {PadButton::R2, T(\"Hopp til bokstav\")}}, 0, 22, ha);\n"
+                "        }\n",
+                r'''        {   /* Jelly5 fix: Square opens sort & filter from anywhere here; say so, under the button.
+                       * A-Å: the letter jump, shown where it works. */
+                      (void)sw;
+                      std::vector<PadHint> hints;
+                      if (by_name() && !m_in_pills)
+                          hints = {{PadButton::L2, ""}, {PadButton::R2, T("Hopp til bokstav")}};
+                      hints.push_back({PadButton::Square, T("Sorter etter")});
+                      draw_pad_hints(gfx::W - kPad, hy + 44, hints, 2, 22, ha);
+                  }
+          ''')
+
+          # --- build.sh's .rodata check: awk quit after the first match, so llvm-readelf died writing the
+          # rest ("Broken pipe") and pipefail failed the build. Read it all. ---
           patch("app/scripts/build.sh",
                 r"""awk '$1=="LOAD" && $7=="R" && $8 ~ /^0x/ {print $2; exit}'""",
                 r"""awk '$1=="LOAD" && $7=="R" && $8 ~ /^0x/ && !f {print $2; f=1}'""")
+
+          # =====================================================================================
+          # Smooth playback (issue #52)
+          #  1. A smooth audio clock: it moves on between the 42.7 ms audio blocks.
+          #  2. Frames released on the display refresh they belong on, one per refresh.
+          # =====================================================================================
+
+          # --- 1. The smooth audio clock -------------------------------------------------------
+          patch("app/engine/media/include/evo_audio_out.h",
+                "float evo_audio_play_speed(void);\n",
+                "float evo_audio_play_speed(void);\n"
+                "/* Jelly5 #52: the audio clock moving smoothly between output blocks (for video pacing). */\n"
+                "double evo_audio_clock_smooth_s(void);\n")
+
+          patch("app/engine/media/src/evo_audio_out.c",
+                "volatile double audio_clock_seconds = 0.0;\n",
+                r'''volatile double audio_clock_seconds = 0.0;
+
+          /* Jelly5 smooth playback (issue #52). audio_clock_seconds moves once per output block
+           * (2048 samples, 42.7 ms), so video paced on it went out in bursts: two frames at once,
+           * then a gap. Each block's hand-over is stamped here, and evo_audio_clock_smooth_s()
+           * moves on between stamps by the wall time passed. It runs half a block behind the
+           * stepped value at each stamp, so on average the A/V sync is what it was. */
+          #include <stdint.h>
+          #include <time.h>
+          static volatile unsigned s_clk_seq;
+          static double s_clk_base, s_clk_adv, s_clk_wall;
+          static uint64_t s_clk_host_us;
+
+          static uint64_t clk_now_us(void)
+          {
+              struct timespec ts;
+              clock_gettime(CLOCK_MONOTONIC, &ts);
+              return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+          }
+
+          /* After audio_clock_seconds moved on: adv_s of media in a block that plays for wall_s. */
+          static void clk_stamp(double adv_s, double wall_s)
+          {
+              __atomic_add_fetch(&s_clk_seq, 1u, __ATOMIC_ACQ_REL);   /* odd: being written */
+              s_clk_base = audio_clock_seconds;
+              s_clk_adv = adv_s;
+              s_clk_wall = wall_s;
+              s_clk_host_us = clk_now_us();
+              __atomic_add_fetch(&s_clk_seq, 1u, __ATOMIC_ACQ_REL);   /* even: done */
+          }
+
+          double evo_audio_clock_smooth_s(void)
+          {
+              double base = 0.0, adv = 0.0, wall = 0.0;
+              uint64_t host = 0;
+              unsigned s0 = 1u, s1 = 0u;
+              for (int tries = 0; tries < 8; tries++) {
+                  s0 = __atomic_load_n(&s_clk_seq, __ATOMIC_ACQUIRE);
+                  base = s_clk_base;
+                  adv = s_clk_adv;
+                  wall = s_clk_wall;
+                  host = s_clk_host_us;
+                  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+                  s1 = __atomic_load_n(&s_clk_seq, __ATOMIC_ACQUIRE);
+                  if (s0 == s1 && !(s0 & 1u))
+                      break;
+              }
+              const double stepped = audio_clock_seconds;
+              if (s0 != s1 || (s0 & 1u) || host == 0 || adv <= 0.0 || wall <= 0.0)
+                  return stepped;
+              if (stepped != base) {
+                  /* A block counted but not stamped yet: where the last one's run ends. A reset
+                   * (a seek, a stop, a new file): the stepped clock until the next block. */
+                  return (stepped > base && stepped - base < 1.0) ? base + adv * 0.5 : stepped;
+              }
+              double f = (double)(clk_now_us() - host) / 1e6 / wall;
+              if (f < 0.0)
+                  f = 0.0;
+              if (f > 1.0)
+                  f = 1.0;   /* no block since (an underrun): the clock waits with the sound */
+              return base + adv * (f - 0.5);
+          }
+          ''')
+
+          patch("app/engine/media/src/evo_audio_out.c",
+                "                    audio_samples_played += jelly5_bs_media_samples();\n"
+                "                    audio_clock_seconds = (double)audio_samples_played / 48000.0;\n",
+                "                    audio_samples_played += jelly5_bs_media_samples();\n"
+                "                    audio_clock_seconds = (double)audio_samples_played / 48000.0;\n"
+                "                    clk_stamp(jelly5_bs_media_samples() / 48000.0, jelly5_bs_media_samples() / 48000.0);   /* #52 */\n")
+
+          patch("app/engine/media/src/evo_audio_out.c",
+                "                audio_clock_seconds = (double)audio_samples_played / 48000.0;\n"
+                "            } else {\n",
+                "                audio_clock_seconds = (double)audio_samples_played / 48000.0;\n"
+                "                clk_stamp(media / 48000.0, (double)AUDIO_BLOCK_SAMPLES / 48000.0);   /* #52: the port plays 48 kHz */\n"
+                "            } else {\n")
+
+          # --- 2. A refresh timestamp from the display ------------------------------------------
+          patch("app/engine/media/src/evo_agc_runtime.c",
+                "int32_t sceVideoOutGetFlipStatus(int32_t handle, void *status);\n",
+                "int32_t sceVideoOutGetFlipStatus(int32_t handle, void *status);\n"
+                "/* Jelly5 #52: when a flip last reached the screen (a refresh), CLOCK_MONOTONIC us; 0 none. */\n"
+                "static volatile uint64_t s_j5_vblank_us;\n")
+
+          patch("app/engine/media/src/evo_agc_runtime.c",
+                "                if (fwaits >= 120u)\n"
+                "                    g_agc_dev.flip_timeouts++;\n",
+                r'''                if (fwaits >= 120u)
+                              g_agc_dev.flip_timeouts++;
+                          /* Jelly5 #52: the flip has just reached the screen, found after a vblank
+                           * wait, so this moment is a refresh. The video pacer lines frames up on it. */
+                          if (fwaits > 0u && fwaits < 120u) {
+                              struct timespec vts;
+                              clock_gettime(CLOCK_MONOTONIC, &vts);
+                              s_j5_vblank_us = (uint64_t)vts.tv_sec * 1000000ull + (uint64_t)vts.tv_nsec / 1000ull;
+                          }
+          ''')
+
+          patch("app/engine/media/src/evo_agc_runtime.c",
+                "int evo_agc_runtime_get_refresh_rate(void)\n"
+                "{\n"
+                "    return g_agc_dev.initialized ? g_agc_dev.current_refresh_rate : 0;\n"
+                "}\n",
+                r'''int evo_agc_runtime_get_refresh_rate(void)
+          {
+              return g_agc_dev.initialized ? g_agc_dev.current_refresh_rate : 0;
+          }
+
+          /* Jelly5 #52: the last refresh seen (a flip reaching the screen, CLOCK_MONOTONIC
+           * microseconds) and the refresh period. 0 when none is known yet. */
+          int evo_agc_runtime_last_vblank(uint64_t *at_us, double *period_us)
+          {
+              const uint64_t at = s_j5_vblank_us;
+              if (!g_agc_dev.initialized || at == 0)
+                  return 0;
+              *at_us = at;
+              *period_us = g_agc_dev.is_120hz ? 1000000.0 / 120.0 : 1000000.0 / 60.0;
+              return 1;
+          }
+          ''')
+
+          # --- 2. The video pacer: the smooth clock, then out on the frame's refresh -------------
+          patch("app/engine/media/src/evo_playback.c",
+                "int decode_next_video_frame(void)\n{\n",
+                r'''/* ---------------------------------------------------------------------------
+           * Jelly5 smooth playback (issue #52): each frame goes out on the display refresh
+           * it belongs on. The player draws a new frame as soon as it is published and
+           * flips it at the next refresh, so a frame published anywhere in a refresh
+           * interval used to land on whichever refresh came first after the drawing:
+           * film at 120 Hz came out 4-6-5-3-7 refreshes a frame instead of 5-5-5-5. Now
+           * each frame is given the refresh nearest to when it is due (one frame per
+           * refresh) and published just after the refresh before it, so the drawing has
+           * the whole interval and the flip lands on that refresh: 5:5 at 120 Hz, 3:2 at
+           * 60 Hz.
+           * ------------------------------------------------------------------------ */
+          int evo_agc_runtime_last_vblank(uint64_t *at_us, double *period_us);
+
+          static uint64_t jelly5_now_us(void)
+          {
+              struct timespec ts;
+              clock_gettime(CLOCK_MONOTONIC, &ts);
+              return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+          }
+
+          /* A refresh seen lately, and the period; 0 when there is none to line up with. */
+          static int jelly5_vblank(uint64_t *at_us, double *period_us)
+          {
+              if (!evo_agc_runtime_last_vblank(at_us, period_us) || *period_us <= 0.0)
+                  return 0;
+              const uint64_t now = jelly5_now_us();
+              return *at_us <= now && now - *at_us < 250000;
+          }
+
+          /* How early the audio wait lets a frame go: early enough for jelly5_vblank_release
+           * to choose its refresh when there is one, else the engine's own 8 ms. */
+          static double jelly5_wait_lead(void)
+          {
+              uint64_t at;
+              double period;
+              return jelly5_vblank(&at, &period) ? 0.030 : 0.008;
+          }
+
+          /* audio_rel, video_rel: the (smooth) audio clock and the frame's time, in seconds. */
+          static void jelly5_vblank_release(double audio_rel, double video_rel)
+          {
+              static double s_last_target = 0.0;
+              double speed = (double)evo_audio_play_speed();
+              if (speed <= 0.0)
+                  speed = 1.0;
+              const double early_us = (video_rel - audio_rel) / speed * 1e6;   /* > 0: due later */
+              uint64_t vb;
+              double period;
+              if (!jelly5_vblank(&vb, &period)) {
+                  /* Nothing to line up with: the engine's own rule, out 8 ms before it is due. */
+                  if (early_us > 8000.0)
+                      usleep((useconds_t)(early_us - 8000.0 < 30000.0 ? early_us - 8000.0 : 30000.0));
+                  return;
+              }
+              const double now = (double)jelly5_now_us();
+              double due = now + early_us;
+              /* Each frame's due time follows from the last one's and the timestamps between them,
+               * nudged a tenth of the way toward the clock: the clock's own jitter (about a
+               * millisecond) then cannot tip a frame onto the refresh beside its own. A jump (a
+               * seek, a stall, a new speed) starts over from the clock. */
+              static double s_last_due = 0.0, s_last_vrel = 0.0;
+              static int s_have_due = 0;
+              if (s_have_due) {
+                  const double pred = s_last_due + (video_rel - s_last_vrel) / speed * 1e6;
+                  if (fabs(due - pred) < 20000.0)
+                      due = pred + 0.1 * (due - pred);
+              }
+              s_last_due = due;
+              s_last_vrel = video_rel;
+              s_have_due = 1;
+              /* The refresh nearest to when it is due, and no earlier than the next one. */
+              double k = floor((due - (double)vb) / period + 0.5);
+              const double k_next = floor((now - (double)vb) / period) + 1.0;
+              if (k < k_next)
+                  k = k_next;
+              double target = (double)vb + k * period;
+              /* One frame per refresh: a second one there would replace the first unseen - unless
+               * that puts it a whole refresh past when it is due (more frames than refreshes). */
+              if (target < s_last_target + period * 0.5 && s_last_target + period - due < period)
+                  target = s_last_target + period;
+              s_last_target = target;
+              /* Out just after the refresh before it, so the drawing has the whole interval. */
+              const double release = target - period + 500.0;
+              if (release > now) {
+                  double wait = release - now;
+                  if (wait > 50000.0)
+                      wait = 50000.0;   /* a guard: the audio wait lets it go at most 30 ms early */
+                  usleep((useconds_t)wait);
+              }
+          }
+
+          int decode_next_video_frame(void)
+          {
+          ''')
+
+          patch("app/engine/media/src/evo_playback.c",
+                "            audio_rel = audio_clock_seconds - evo_av_offset_s;   /* Jelly5: the audio delay setting */\n",
+                "            audio_rel = evo_audio_clock_smooth_s() - evo_av_offset_s;   /* Jelly5: the audio delay setting; #52: the smooth clock */\n")
+
+          patch("app/engine/media/src/evo_playback.c",
+                "                    audio_rel = audio_clock_seconds - evo_av_offset_s;\n",
+                "                    audio_rel = evo_audio_clock_smooth_s() - evo_av_offset_s;   /* #52 */\n")
+
+          patch("app/engine/media/src/evo_playback.c",
+                "                while (behind < -0.008 &&\n",
+                "                const double j5_lead = jelly5_wait_lead();   /* #52 */\n"
+                "                while (behind < -j5_lead &&\n")
+
+          patch("app/engine/media/src/evo_playback.c",
+                "                    if (stuck_iters >= 8)\n"
+                "                        break;\n"
+                "                }\n",
+                r'''                    if (stuck_iters >= 8)
+                                  break;
+                          }
+
+                          /* Jelly5 #52: out on the refresh the frame belongs on. The wall-time
+                           * clock in pp_playback then follows the audio, so it adds no wait of its
+                           * own (it would undo the line-up) - except when the picture is badly
+                           * behind the sound, where its late-frame drops still help it catch up. */
+                          if (behind >= -j5_lead && !player_paused && video_decode_ready) {
+                              jelly5_vblank_release(evo_audio_clock_smooth_s() - evo_av_offset_s, video_rel);
+                              if (behind < 0.10 && g_pp_pb.active && g_pp_pb.clock.started && !g_pp_pb.seek_discarding &&
+                                  !pp_clock_is_paused(&g_pp_pb.clock))
+                                  pp_clock_reanchor(&g_pp_pb.clock, pf.pts_us);
+                          }
+          ''')
           PY
           git diff --stat
 
