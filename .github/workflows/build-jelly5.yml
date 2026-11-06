@@ -1,48 +1,21 @@
 # Builds Jelly5 with these fixes. Start it from the Actions tab:
-# "Build Jelly5" -> "Run workflow", tick the switches you want, "Run workflow".
-# The result is a download called PPSA99505 on the run's page.
+# "Build Jelly5" -> "Run workflow". The result is a download called PPSA99505 on
+# the run's page.
 #
-# Always in:
+# What it changes:
 #  - The library pills: the glass bar keeps its size (also while a library loads)
 #    and the names slide inside it, fading at the edges where more lie beyond.
 #  - The focus on those pills goes straight to the name and settles without
 #    swinging back.
 #  - Left/right move through the libraries only; Square (shown as a hint) or Up from
 #    the grid's right half reaches sort & filter.
+#  - Smoother video (issue #52): the audio clock the picture follows moves smoothly
+#    instead of in 42.7 ms steps.
 #  - build.sh: the "Broken pipe" failure on Linux.
-#
-# Switches (issue #52, smoother video), all off by default = playback as in the
-# official app:
-#  - smooth_clock:   the audio clock the picture follows moves smoothly instead of in
-#                    42.7 ms steps.
-#  - refresh_timing: each frame goes out on the display refresh it belongs on.
-#  - steady_filter:  steadies refresh_timing against clock jitter (only with it).
-#  - timing_log:     writes /data/evoplayer/jelly5-timing.log on the PS5 (fetch it by
-#                    FTP): once a second, and every frame for 3 s after a seek.
 name: Build Jelly5
-run-name: >-
-  Build Jelly5 (smooth_clock=${{ inputs.smooth_clock }}, refresh_timing=${{ inputs.refresh_timing }},
-  steady_filter=${{ inputs.steady_filter }}, timing_log=${{ inputs.timing_log }})
 
 on:
   workflow_dispatch:
-    inputs:
-      smooth_clock:
-        description: "Video: smooth audio clock (#52 change 1)"
-        type: boolean
-        default: false
-      refresh_timing:
-        description: "Video: time frames to screen refreshes (#52 change 2)"
-        type: boolean
-        default: false
-      steady_filter:
-        description: "Video: steadying filter (only matters with refresh timing)"
-        type: boolean
-        default: true
-      timing_log:
-        description: "Write a timing log to /data/evoplayer/jelly5-timing.log"
-        type: boolean
-        default: false
 
 jobs:
   build:
@@ -208,46 +181,30 @@ jobs:
                 r"""awk '$1=="LOAD" && $7=="R" && $8 ~ /^0x/ && !f {print $2; f=1}'""")
 
           # =====================================================================================
-          # Smooth playback (issue #52) - every part behind a build switch, off by default:
-          #   J5_SMOOTH_CLOCK    the audio clock moves on between its 42.7 ms blocks
-          #   J5_REFRESH_TIMING  each frame goes out on the display refresh it belongs on
-          #   J5_STEADY_FILTER   (with J5_REFRESH_TIMING) due times steadied against clock jitter
-          #   J5_TIMING_LOG      a once-a-second timing log: /data/evoplayer/jelly5-timing.log
-          # With none of them the engine plays exactly as before.
+          # Smooth playback (issue #52): the audio clock the picture follows moves smoothly
+          # between its 42.7 ms output blocks, instead of in steps. Nothing else in playback
+          # changes.
           # =====================================================================================
-
-          # --- build.sh: the switches come in from the workflow -----------------------------------
-          patch("app/scripts/build.sh",
-                "(( AV1_ON )) && JELLY5_DEFS+=\" -DJELLY5_AV1=1\"\n",
-                "(( AV1_ON )) && JELLY5_DEFS+=\" -DJELLY5_AV1=1\"\n"
-                "if [[ -n \"${JELLY5_EXTRA_DEFS:-}\" ]]; then JELLY5_DEFS+=\" ${JELLY5_EXTRA_DEFS}\"; fi   # Jelly5 fork: the workflow's switches\n")
-
-          # --- The smooth audio clock, and how evenly the port takes blocks -----------------------
           patch("app/engine/media/include/evo_audio_out.h",
                 "float evo_audio_play_speed(void);\n",
                 "float evo_audio_play_speed(void);\n"
                 "/* Jelly5 #52: the audio clock moving smoothly between output blocks (for video pacing). */\n"
-                "double evo_audio_clock_smooth_s(void);\n"
-                "/* Jelly5 #52 timing log: block hand-overs since the last call (intervals in ms), then reset. */\n"
-                "void evo_audio_clock_take_stats(unsigned *n, double *avg_ms, double *min_ms, double *max_ms,\n"
-                "                                unsigned *bursts, unsigned *gaps);\n")
+                "double evo_audio_clock_smooth_s(void);\n")
 
           patch("app/engine/media/src/evo_audio_out.c",
                 "volatile double audio_clock_seconds = 0.0;\n",
                 r'''volatile double audio_clock_seconds = 0.0;
 
           /* Jelly5 smooth playback (issue #52). audio_clock_seconds moves once per output block
-           * (2048 samples, 42.7 ms), so video paced on it went out in bursts. Each block's
-           * hand-over is stamped here, and evo_audio_clock_smooth_s() moves on between stamps by
-           * the wall time passed, half a block behind the stepped value at each stamp so on
-           * average the A/V sync is what it was. Used only with J5_SMOOTH_CLOCK; the stamps also
-           * feed the timing log (how evenly the port takes blocks). */
+           * (2048 samples, 42.7 ms), so video paced on it went out in bursts: two frames at once,
+           * then a gap. Each block's hand-over is stamped here, and evo_audio_clock_smooth_s()
+           * moves on between stamps by the wall time passed. It runs half a block behind the
+           * stepped value at each stamp, so on average the A/V sync is what it was. */
           #include <stdint.h>
           #include <time.h>
           static volatile unsigned s_clk_seq;
           static double s_clk_base, s_clk_adv, s_clk_wall;
           static uint64_t s_clk_host_us;
-          static uint64_t s_ho_prev_us, s_ho_n, s_ho_sum_us, s_ho_min_us, s_ho_max_us, s_ho_bursts, s_ho_gaps;
 
           static uint64_t clk_now_us(void)
           {
@@ -266,32 +223,6 @@ jobs:
               s_clk_wall = wall_s;
               s_clk_host_us = now;
               __atomic_add_fetch(&s_clk_seq, 1u, __ATOMIC_ACQ_REL);   /* even: done */
-              if (s_ho_prev_us && now > s_ho_prev_us) {
-                  const uint64_t d = now - s_ho_prev_us, w = (uint64_t)(wall_s * 1e6);
-                  s_ho_n++;
-                  s_ho_sum_us += d;
-                  if (!s_ho_min_us || d < s_ho_min_us)
-                      s_ho_min_us = d;
-                  if (d > s_ho_max_us)
-                      s_ho_max_us = d;
-                  if (d < w / 2)
-                      s_ho_bursts++;   /* came much sooner than a block plays */
-                  if (d > w + w / 2)
-                      s_ho_gaps++;     /* came much later */
-              }
-              s_ho_prev_us = now;
-          }
-
-          void evo_audio_clock_take_stats(unsigned *n, double *avg_ms, double *min_ms, double *max_ms,
-                                          unsigned *bursts, unsigned *gaps)
-          {
-              *n = (unsigned)s_ho_n;
-              *avg_ms = s_ho_n ? (double)s_ho_sum_us / 1000.0 / (double)s_ho_n : 0.0;
-              *min_ms = (double)s_ho_min_us / 1000.0;
-              *max_ms = (double)s_ho_max_us / 1000.0;
-              *bursts = (unsigned)s_ho_bursts;
-              *gaps = (unsigned)s_ho_gaps;
-              s_ho_n = s_ho_sum_us = s_ho_min_us = s_ho_max_us = s_ho_bursts = s_ho_gaps = 0;
           }
 
           double evo_audio_clock_smooth_s(void)
@@ -341,417 +272,14 @@ jobs:
                 "                clk_stamp(media / 48000.0, (double)AUDIO_BLOCK_SAMPLES / 48000.0);   /* #52: the port plays 48 kHz */\n"
                 "            } else {\n")
 
-          # --- The display: refresh timestamps, and flip statistics for the log -------------------
-          patch("app/engine/media/src/evo_agc_runtime.c",
-                "int32_t sceVideoOutGetFlipStatus(int32_t handle, void *status);\n",
-                r'''int32_t sceVideoOutGetFlipStatus(int32_t handle, void *status);
-          /* Jelly5 #52: when a flip last reached the screen (a refresh), CLOCK_MONOTONIC us; 0 none.
-           * And for the timing log: refreshes between flips, vblank waits per flip, and the time
-           * between back-to-back vblank waits (the real refresh period). */
-          static volatile uint64_t s_j5_vblank_us;
-          static unsigned s_j5_hist[10], s_j5_fw[4], s_j5_wb_n;
-          static double s_j5_err_max, s_j5_wb_min, s_j5_wb_sum;
-          static uint64_t j5_mono_us(void)
-          {
-              struct timespec ts;
-              clock_gettime(CLOCK_MONOTONIC, &ts);
-              return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
-          }
-          ''')
-
-          patch("app/engine/media/src/evo_agc_runtime.c",
-                "                unsigned fwaits = 0;\n"
-                "                for (; fwaits < 120u; ++fwaits) {\n",
-                "                unsigned fwaits = 0;\n"
-                "                uint64_t j5_prev_wb = 0;   /* #52 log: the last vblank wait's return */\n"
-                "                for (; fwaits < 120u; ++fwaits) {\n")
-
-          patch("app/engine/media/src/evo_agc_runtime.c",
-                "                    sceVideoOutWaitVblank(g_agc_dev.video_handle);\n"
-                "                }\n",
-                r'''                    sceVideoOutWaitVblank(g_agc_dev.video_handle);
-                              {   /* #52 log: two waits in a row are one refresh apart */
-                                  const uint64_t wb = j5_mono_us();
-                                  if (j5_prev_wb && wb > j5_prev_wb && wb - j5_prev_wb < 100000u) {
-                                      const double d = (double)(wb - j5_prev_wb);
-                                      s_j5_wb_n++;
-                                      s_j5_wb_sum += d;
-                                      if (s_j5_wb_min == 0.0 || d < s_j5_wb_min)
-                                          s_j5_wb_min = d;
-                                  }
-                                  j5_prev_wb = wb;
-                              }
-                          }
-          ''')
-
-          patch("app/engine/media/src/evo_agc_runtime.c",
-                "                if (fwaits >= 120u)\n"
-                "                    g_agc_dev.flip_timeouts++;\n",
-                r'''                if (fwaits >= 120u)
-                              g_agc_dev.flip_timeouts++;
-                          /* Jelly5 #52: the flip has just reached the screen, found after a vblank
-                           * wait, so this moment is a refresh. The video pacer can line frames up
-                           * on it (J5_REFRESH_TIMING); the timing log counts the refreshes between
-                           * flips - while the interface is hidden, how long each frame stayed up. */
-                          {
-                              const uint64_t vnow = j5_mono_us();
-                              s_j5_fw[fwaits > 3u ? 3u : fwaits]++;
-                              if (fwaits > 0u && fwaits < 120u) {
-                                  const double per = g_agc_dev.is_120hz ? 1000000.0 / 120.0 : 1000000.0 / 60.0;
-                                  if (s_j5_vblank_us && vnow > s_j5_vblank_us) {
-                                      const double d = (double)(vnow - s_j5_vblank_us);
-                                      double k = (double)(long long)(d / per + 0.5);
-                                      double err = d - k * per;
-                                      if (err < 0.0)
-                                          err = -err;
-                                      if (err > s_j5_err_max)
-                                          s_j5_err_max = err;
-                                      if (k > 9.0)
-                                          k = 9.0;
-                                      s_j5_hist[(int)k]++;
-                                  }
-                                  s_j5_vblank_us = vnow;
-                              }
-                          }
-          ''')
-
-          patch("app/engine/media/src/evo_agc_runtime.c",
-                "int evo_agc_runtime_get_refresh_rate(void)\n"
-                "{\n"
-                "    return g_agc_dev.initialized ? g_agc_dev.current_refresh_rate : 0;\n"
-                "}\n",
-                r'''int evo_agc_runtime_get_refresh_rate(void)
-          {
-              return g_agc_dev.initialized ? g_agc_dev.current_refresh_rate : 0;
-          }
-
-          /* Jelly5 #52: the last refresh seen (a flip reaching the screen, CLOCK_MONOTONIC
-           * microseconds) and the refresh period. 0 when none is known yet. */
-          int evo_agc_runtime_last_vblank(uint64_t *at_us, double *period_us)
-          {
-              const uint64_t at = s_j5_vblank_us;
-              if (!g_agc_dev.initialized || at == 0)
-                  return 0;
-              *at_us = at;
-              *period_us = g_agc_dev.is_120hz ? 1000000.0 / 120.0 : 1000000.0 / 60.0;
-              return 1;
-          }
-
-          /* Jelly5 #52 timing log: the flip statistics since the last call, then reset. */
-          void evo_agc_runtime_take_flip_stats(unsigned hist[10], unsigned fw[4], double *err_max_us,
-                                               double *wb_min_us, double *wb_avg_us, unsigned *wb_n,
-                                               int *is_120hz, int *rate_id)
-          {
-              for (int i = 0; i < 10; i++) {
-                  hist[i] = s_j5_hist[i];
-                  s_j5_hist[i] = 0;
-              }
-              for (int i = 0; i < 4; i++) {
-                  fw[i] = s_j5_fw[i];
-                  s_j5_fw[i] = 0;
-              }
-              *err_max_us = s_j5_err_max;
-              *wb_min_us = s_j5_wb_min;
-              *wb_avg_us = s_j5_wb_n ? s_j5_wb_sum / (double)s_j5_wb_n : 0.0;
-              *wb_n = s_j5_wb_n;
-              *is_120hz = g_agc_dev.is_120hz;
-              *rate_id = g_agc_dev.current_refresh_rate;
-              s_j5_err_max = 0.0;
-              s_j5_wb_min = 0.0;
-              s_j5_wb_sum = 0.0;
-              s_j5_wb_n = 0;
-          }
-          ''')
-
-          # --- The video pacer -------------------------------------------------------------------
-          patch("app/engine/media/src/evo_playback.c",
-                "int decode_next_video_frame(void)\n{\n",
-                r'''/* ---------------------------------------------------------------------------
-           * Jelly5 smooth playback (issue #52), each part behind a build switch:
-           *
-           * J5_SMOOTH_CLOCK: video waits on the smooth audio clock (evo_audio_clock_smooth_s)
-           * instead of the one that moves in 42.7 ms steps.
-           *
-           * J5_REFRESH_TIMING: each frame goes out on the display refresh it belongs on. It is
-           * given the refresh nearest to when it is due (one frame per refresh) and published
-           * just after the refresh before it, so drawing has the whole interval and the flip
-           * lands on that refresh. J5_STEADY_FILTER steadies the due times against clock jitter.
-           *
-           * J5_TIMING_LOG: once a second, a line in /data/evoplayer/jelly5-timing.log; every
-           * frame for 3 s after a seek.
-           * ------------------------------------------------------------------------ */
-          int evo_agc_runtime_last_vblank(uint64_t *at_us, double *period_us);
-          void evo_agc_runtime_take_flip_stats(unsigned hist[10], unsigned fw[4], double *err_max_us,
-                                               double *wb_min_us, double *wb_avg_us, unsigned *wb_n,
-                                               int *is_120hz, int *rate_id);
-
-          #ifdef J5_SMOOTH_CLOCK
-          #define J5_AUDIO_CLOCK() evo_audio_clock_smooth_s()
-          #else
-          #define J5_AUDIO_CLOCK() ((double)audio_clock_seconds)
-          #endif
-
-          /* What the pacer did, for the timing log. */
-          static __attribute__((unused)) unsigned j5_c_aligned, j5_c_relpast, j5_c_bumps, j5_c_filter_resets, j5_c_novb;
-          static __attribute__((unused)) double j5_c_relpast_max_us;
-
-          static __attribute__((unused)) uint64_t jelly5_now_us(void)
-          {
-              struct timespec ts;
-              clock_gettime(CLOCK_MONOTONIC, &ts);
-              return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
-          }
-
-          /* A refresh seen lately, and the period; 0 when there is none to line up with. */
-          static __attribute__((unused)) int jelly5_vblank(uint64_t *at_us, double *period_us)
-          {
-              if (!evo_agc_runtime_last_vblank(at_us, period_us) || *period_us <= 0.0)
-                  return 0;
-              const uint64_t now = jelly5_now_us();
-              return *at_us <= now && now - *at_us < 250000;
-          }
-
-          /* How early the audio wait lets a frame go: early enough for jelly5_vblank_release
-           * to choose its refresh when there is one, else the engine's own 8 ms. */
-          static double jelly5_wait_lead(void)
-          {
-          #ifdef J5_REFRESH_TIMING
-              uint64_t at;
-              double period;
-              return jelly5_vblank(&at, &period) ? 0.030 : 0.008;
-          #else
-              return 0.008;
-          #endif
-          }
-
-          #ifdef J5_REFRESH_TIMING
-          /* audio_rel, video_rel: the audio clock and the frame's time, in seconds. */
-          static void jelly5_vblank_release(double audio_rel, double video_rel)
-          {
-              static double s_last_target = 0.0;
-              double speed = (double)evo_audio_play_speed();
-              if (speed <= 0.0)
-                  speed = 1.0;
-              const double early_us = (video_rel - audio_rel) / speed * 1e6;   /* > 0: due later */
-              uint64_t vb;
-              double period;
-              if (!jelly5_vblank(&vb, &period)) {
-                  /* Nothing to line up with: the engine's own rule, out 8 ms before it is due. */
-                  j5_c_novb++;
-                  if (early_us > 8000.0)
-                      usleep((useconds_t)(early_us - 8000.0 < 30000.0 ? early_us - 8000.0 : 30000.0));
-                  return;
-              }
-              const double now = (double)jelly5_now_us();
-              double due = now + early_us;
-          #ifdef J5_STEADY_FILTER
-              /* Each frame's due time follows from the last one's and the timestamps between them,
-               * nudged a tenth of the way toward the clock, so the clock's own jitter cannot tip a
-               * frame onto the refresh beside its own. A jump (a seek, a stall, a new speed)
-               * starts over from the clock. */
-              static double s_last_due = 0.0, s_last_vrel = 0.0;
-              static int s_have_due = 0;
-              if (s_have_due) {
-                  const double pred = s_last_due + (video_rel - s_last_vrel) / speed * 1e6;
-                  if (fabs(due - pred) < 20000.0)
-                      due = pred + 0.1 * (due - pred);
-                  else
-                      j5_c_filter_resets++;
-              }
-              s_last_due = due;
-              s_last_vrel = video_rel;
-              s_have_due = 1;
-          #endif
-              /* The refresh nearest to when it is due, and no earlier than the next one. */
-              double k = floor((due - (double)vb) / period + 0.5);
-              const double k_next = floor((now - (double)vb) / period) + 1.0;
-              if (k < k_next)
-                  k = k_next;
-              double target = (double)vb + k * period;
-              /* One frame per refresh: a second one there would replace the first unseen - unless
-               * that puts it a whole refresh past when it is due (more frames than refreshes). */
-              if (target < s_last_target + period * 0.5 && s_last_target + period - due < period) {
-                  target = s_last_target + period;
-                  j5_c_bumps++;
-              }
-              s_last_target = target;
-              j5_c_aligned++;
-              /* Out just after the refresh before it, so the drawing has the whole interval. */
-              const double release = target - period + 500.0;
-              if (release > now) {
-                  double wait = release - now;
-                  if (wait > 50000.0)
-                      wait = 50000.0;   /* a guard: the audio wait lets it go at most 30 ms early */
-                  usleep((useconds_t)wait);
-              } else {
-                  j5_c_relpast++;   /* already past the moment it should have gone */
-                  if (now - release > j5_c_relpast_max_us)
-                      j5_c_relpast_max_us = now - release;
-              }
-          }
-          #endif
-
-          #ifdef J5_TIMING_LOG
-          #include "evo_data_path.h"
-          static FILE *j5_log;
-          static uint64_t j5_log_since, j5_log_retry, j5_seek_until, j5_seek_at;
-          static double j5_log_last_vrel = -1.0;
-          static unsigned j5_fr, j5_late40, j5_early40, j5_off_n;
-          static double j5_off_min, j5_off_max, j5_off_sum, j5_soff_sum;
-          static uint64_t j5_pp_drops0;
-
-          static void j5_log_reset(void)
-          {
-              j5_fr = j5_late40 = j5_early40 = j5_off_n = 0;
-              j5_off_min = 1e9;
-              j5_off_max = -1e9;
-              j5_off_sum = j5_soff_sum = 0.0;
-              j5_c_aligned = j5_c_relpast = j5_c_bumps = j5_c_filter_resets = j5_c_novb = 0;
-              j5_c_relpast_max_us = 0.0;
-          }
-
-          static void j5_log_line(uint64_t now)
-          {
-              unsigned an, ab, ag, hist[10], fw[4], wbn;
-              double aavg, amin, amax, errmax, wbmin, wbavg;
-              int is120, rid;
-              evo_audio_clock_take_stats(&an, &aavg, &amin, &amax, &ab, &ag);
-              evo_agc_runtime_take_flip_stats(hist, fw, &errmax, &wbmin, &wbavg, &wbn, &is120, &rid);
-              const uint64_t drops = g_pp_pb.stats.frames_late_dropped;
-              const double n = j5_off_n ? (double)j5_off_n : 1.0;
-              fprintf(j5_log,
-                      "t=%.1f frames=%u | av_offset_ms (+ = picture late) min=%.1f avg=%.1f max=%.1f smooth_avg=%.1f "
-                      "late>40ms=%u early>40ms=%u | audio_blocks n=%u every avg=%.2f min=%.2f max=%.2f ms bursts=%u gaps=%u "
-                      "| refreshes_per_flip[0..9+]=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u flip_waits[0,1,2,3+]=%u,%u,%u,%u "
-                      "refresh_err_max=%.2fms refresh_period n=%u min=%.2f avg=%.2f ms 120hz=%d rate_id=%d "
-                      "| aligned=%u released_late=%u (max %.1fms) bumped=%u filter_resets=%u no_refresh=%u "
-                      "| pp_drops=%llu speed=%.2f\n",
-                      (double)(now - j5_seek_at) / 1e6, j5_fr,
-                      j5_off_n ? j5_off_min * 1000.0 : 0.0, j5_off_sum / n * 1000.0, j5_off_n ? j5_off_max * 1000.0 : 0.0,
-                      j5_soff_sum / n * 1000.0, j5_late40, j5_early40,
-                      an, aavg, amin, amax, ab, ag,
-                      hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7], hist[8], hist[9],
-                      fw[0], fw[1], fw[2], fw[3],
-                      errmax / 1000.0, wbn, wbmin / 1000.0, wbavg / 1000.0, is120, rid,
-                      j5_c_aligned, j5_c_relpast, j5_c_relpast_max_us / 1000.0, j5_c_bumps, j5_c_filter_resets, j5_c_novb,
-                      (unsigned long long)(drops - j5_pp_drops0), (double)evo_audio_play_speed());
-              fflush(j5_log);
-              j5_pp_drops0 = drops;
-              j5_log_reset();
-          }
-
-          /* Each shown frame (not those a seek throws away). */
-          static void jelly5_timing_frame(double video_rel)
-          {
-              const uint64_t now = jelly5_now_us();
-              if (!j5_log) {
-                  if (now < j5_log_retry)
-                      return;
-                  j5_log = fopen(evo_data_path("jelly5-timing.log"), "a");
-                  if (!j5_log) {
-                      j5_log_retry = now + 5000000u;
-                      return;
-                  }
-                  j5_log_since = j5_seek_at = now;
-                  j5_pp_drops0 = g_pp_pb.stats.frames_late_dropped;
-                  j5_log_reset();
-                  int sc = 0, rt = 0, sf = 0;
-          #ifdef J5_SMOOTH_CLOCK
-                  sc = 1;
-          #endif
-          #ifdef J5_REFRESH_TIMING
-                  rt = 1;
-          #endif
-          #ifdef J5_STEADY_FILTER
-                  sf = 1;
-          #endif
-                  fprintf(j5_log, "=== Jelly5 timing log: smooth_clock=%d refresh_timing=%d steady_filter=%d ===\n",
-                          sc, rt, sf);
-              }
-              if (j5_log_last_vrel >= 0.0 && video_rel < j5_log_last_vrel - 0.5) {   /* a seek (or a new file) */
-                  j5_log_line(now);
-                  fprintf(j5_log, "--- seek: picture time %.2f s -> %.2f s (from where it restarted) ---\n",
-                          j5_log_last_vrel, video_rel);
-                  j5_log_since = j5_seek_at = now;
-                  j5_seek_until = now + 3000000u;
-              }
-              j5_log_last_vrel = video_rel;
-              const double stepped = (double)audio_clock_seconds;
-              if (stepped > 0.05) {   /* the sound is running: how far apart they are */
-                  const double off = stepped - evo_av_offset_s - video_rel;
-                  const double soff = evo_audio_clock_smooth_s() - evo_av_offset_s - video_rel;
-                  j5_off_n++;
-                  j5_off_sum += off;
-                  j5_soff_sum += soff;
-                  if (off < j5_off_min)
-                      j5_off_min = off;
-                  if (off > j5_off_max)
-                      j5_off_max = off;
-                  if (off > 0.040)
-                      j5_late40++;
-                  if (off < -0.040)
-                      j5_early40++;
-                  if (now < j5_seek_until)
-                      fprintf(j5_log, "  after seek +%.2fs: picture=%.3f sound=%.3f smooth=%.3f offset=%.1fms\n",
-                              (double)(now - j5_seek_at) / 1e6, video_rel, stepped - evo_av_offset_s,
-                              evo_audio_clock_smooth_s() - evo_av_offset_s, off * 1000.0);
-              }
-              j5_fr++;
-              if (now - j5_log_since >= 1000000u) {
-                  j5_log_line(now);
-                  j5_log_since = now;
-              }
-          }
-          #else
-          #define jelly5_timing_frame(v) ((void)0)
-          #endif
-
-          int decode_next_video_frame(void)
-          {
-          ''')
-
+          # The picture waits on the smooth clock (the progress bar and subtitles keep the other).
           patch("app/engine/media/src/evo_playback.c",
                 "            audio_rel = audio_clock_seconds - evo_av_offset_s;   /* Jelly5: the audio delay setting */\n",
-                "            audio_rel = J5_AUDIO_CLOCK() - evo_av_offset_s;   /* Jelly5: the audio delay setting; #52: which clock */\n")
+                "            audio_rel = evo_audio_clock_smooth_s() - evo_av_offset_s;   /* Jelly5: the audio delay setting; #52: the smooth clock */\n")
 
           patch("app/engine/media/src/evo_playback.c",
                 "                    audio_rel = audio_clock_seconds - evo_av_offset_s;\n",
-                "                    audio_rel = J5_AUDIO_CLOCK() - evo_av_offset_s;   /* #52 */\n")
-
-          patch("app/engine/media/src/evo_playback.c",
-                "                while (behind < -0.008 &&\n",
-                "                const double j5_lead = jelly5_wait_lead();   /* #52: 8 ms unless J5_REFRESH_TIMING */\n"
-                "                while (behind < -j5_lead &&\n")
-
-          patch("app/engine/media/src/evo_playback.c",
-                "                    if (stuck_iters >= 8)\n"
-                "                        break;\n"
-                "                }\n",
-                r'''                    if (stuck_iters >= 8)
-                                  break;
-                          }
-
-          #ifdef J5_REFRESH_TIMING
-                          /* Jelly5 #52: out on the refresh the frame belongs on. The wall-time
-                           * clock in pp_playback then follows the audio, so it adds no wait of its
-                           * own (it would undo the line-up) - except when the picture is badly
-                           * behind the sound, where its late-frame drops still help it catch up. */
-                          if (behind >= -j5_lead && !player_paused && video_decode_ready) {
-                              jelly5_vblank_release(J5_AUDIO_CLOCK() - evo_av_offset_s, video_rel);
-                              if (behind < 0.10 && g_pp_pb.active && g_pp_pb.clock.started && !g_pp_pb.seek_discarding &&
-                                  !pp_clock_is_paused(&g_pp_pb.clock))
-                                  pp_clock_reanchor(&g_pp_pb.clock, pf.pts_us);
-                          }
-          #endif
-          ''')
-
-          patch("app/engine/media/src/evo_playback.c",
-                "            if (recv_ret == 1 && g_pp_pb.active) {\n"
-                "                present_pp_frame(&pf);\n",
-                "            if (!seek_discarding)\n"
-                "                jelly5_timing_frame(video_rel);   /* #52: J5_TIMING_LOG only */\n"
-                "            if (recv_ret == 1 && g_pp_pb.active) {\n"
-                "                present_pp_frame(&pf);\n")
+                "                    audio_rel = evo_audio_clock_smooth_s() - evo_av_offset_s;   /* #52: the smooth clock */\n")
           PY
           git diff --stat
 
@@ -765,19 +293,7 @@ jobs:
         run: scripts/setup-toolchain.sh
 
       - name: Build the app
-        env:
-          SW_SMOOTH: ${{ inputs.smooth_clock }}
-          SW_REFRESH: ${{ inputs.refresh_timing }}
-          SW_FILTER: ${{ inputs.steady_filter }}
-          SW_LOG: ${{ inputs.timing_log }}
         run: |
-          DEFS=""
-          if [ "$SW_SMOOTH" = "true" ]; then DEFS="$DEFS -DJ5_SMOOTH_CLOCK"; fi
-          if [ "$SW_REFRESH" = "true" ]; then DEFS="$DEFS -DJ5_REFRESH_TIMING"; fi
-          if [ "$SW_FILTER" = "true" ]; then DEFS="$DEFS -DJ5_STEADY_FILTER"; fi
-          if [ "$SW_LOG" = "true" ]; then DEFS="$DEFS -DJ5_TIMING_LOG"; fi
-          echo "Switches:${DEFS:- none}"
-          export JELLY5_EXTRA_DEFS="$DEFS"
           eval "$(scripts/setup-toolchain.sh --env)"
           cd app
           ./scripts/build.sh
